@@ -11,7 +11,7 @@
 # Installs:
 #   - Matching kernel headers
 #   - base-devel, dkms, git
-#   - rtl8812au-dkms (AUR)
+#   - RTL8812AU DKMS driver from AUR (prefers aircrack-ng variant)
 #
 # Usage:
 #   chmod +x install-awus036ach-arch.sh
@@ -38,21 +38,22 @@ if ! command -v sudo >/dev/null 2>&1; then
   die "sudo not found. Install sudo first."
 fi
 
+if ! command -v pacman >/dev/null 2>&1; then
+  die "pacman not found. This script is for Arch-based distributions only."
+fi
+
 log "ALFA AWUS036ACH (RTL8812AU) installer for Arch-based Linux"
-log "Kernel: $(uname -r)"
+KREL="$(uname -r)"
+log "Kernel: ${KREL}"
 
 # Detect kernel flavor and choose headers package
-KREL="$(uname -r)"
-HEADERS_PKG=""
-
+HEADERS_PKG="linux-headers"
 if echo "$KREL" | grep -qi "cachyos"; then
   HEADERS_PKG="linux-cachyos-headers"
 elif echo "$KREL" | grep -qi "zen"; then
   HEADERS_PKG="linux-zen-headers"
 elif echo "$KREL" | grep -qi "lts"; then
   HEADERS_PKG="linux-lts-headers"
-else
-  HEADERS_PKG="linux-headers"
 fi
 
 log "Using headers package: ${HEADERS_PKG}"
@@ -64,7 +65,7 @@ sudo pacman -S --needed --noconfirm "${HEADERS_PKG}" base-devel dkms git
 # Verify headers match running kernel
 if [[ ! -e "/usr/lib/modules/${KREL}/build" ]]; then
   warn "Kernel headers do not appear to match the running kernel: ${KREL}"
-  warn "If you recently updated the kernel, reboot and run this script again."
+  warn "Reboot after kernel updates, then re-run this installer."
 fi
 
 # Ensure yay exists (AUR helper)
@@ -91,11 +92,40 @@ log "Removing any conflicting RTL88xxAU modules (if present)..."
 lsmod | grep -q "^88XXau" && sudo modprobe -r 88XXau || true
 lsmod | grep -q "^8812au" && sudo modprobe -r 8812au || true
 
-log "Installing rtl8812au-dkms from AUR..."
-yay -S --needed --noconfirm rtl8812au-dkms
+log "Selecting RTL8812AU DKMS driver package from AUR..."
 
-log "Loading driver module (88XXau)..."
-sudo modprobe 88XXau || die "Failed to load 88XXau. Check dmesg for details."
+# Prefer the aircrack-ng DKMS driver (monitor mode + injection)
+CANDIDATES=(
+  "rtl8812au-aircrack-ng-dkms-git"
+  "rtl8812au-dkms-git"
+  "rtl8812au-openhd-dkms-git"
+)
+
+PKG_FOUND=""
+for pkg in "${CANDIDATES[@]}"; do
+  if yay -Si "$pkg" >/dev/null 2>&1; then
+    PKG_FOUND="$pkg"
+    break
+  fi
+done
+
+if [[ -z "$PKG_FOUND" ]]; then
+  die "No supported RTL8812AU DKMS package found in AUR. Try: yay -Ss rtl8812au"
+fi
+
+log "Found AUR package: ${PKG_FOUND}"
+log "Installing ${PKG_FOUND}..."
+yay -S --needed --noconfirm "${PKG_FOUND}"
+
+# Ensure DKMS built something for the current kernel (best effort)
+if command -v dkms >/dev/null 2>&1; then
+  log "DKMS status:"
+  dkms status || true
+fi
+
+log "Loading driver module..."
+sudo modprobe 8812au 2>/dev/null || sudo modprobe 88XXau 2>/dev/null || \
+  die "Failed to load module (tried 8812au and 88XXau). Check: dkms status && dmesg | tail -n 120"
 
 ok "Driver loaded successfully."
 
@@ -109,7 +139,7 @@ echo
 echo "Next steps (enable monitor mode):"
 echo "  1) Identify the ALFA interface (commonly wlan1):"
 echo "     iw dev"
-echo "  2) Enable monitor mode:"
+echo "  2) Enable monitor mode (replace wlan1 if needed):"
 echo "     sudo ip link set wlan1 down"
 echo "     sudo iw dev wlan1 set type monitor"
 echo "     sudo ip link set wlan1 up"
@@ -118,4 +148,4 @@ echo
 echo "Troubleshooting:"
 echo "  - Reboot after kernel updates"
 echo "  - Verify DKMS: dkms status"
-echo "  - Check logs: dmesg | tail -n 80"
+echo "  - Check logs: dmesg | tail -n 120"
