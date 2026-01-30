@@ -54,7 +54,7 @@ It enables **monitor mode** and **packet injection**, and is designed to **survi
 ---
 
 ## Installation
-
+Quick Install (Arch / CachyOS / Arch Black)
 ```bash
 git clone https://github.com/socalit/install-awus036ach-arch.git
 cd install-awus036ach-arch
