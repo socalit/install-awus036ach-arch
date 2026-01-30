@@ -58,8 +58,8 @@ It enables **monitor mode** and **packet injection**, and is designed to **survi
 ```bash
 git clone https://github.com/socalit/awus036ach-cachyos-installer.git
 cd awus036ach-cachyos-installer
-chmod +x install-awus036ach-cachyos.sh
-./install-awus036ach-cachyos.sh
+chmod +x install-awus036ach-arch.sh
+./install-awus036ach-arch.sh
 ```
 The installer will:
 
