@@ -1,4 +1,4 @@
-# SoCal IT – AWUS036ACH (RTL8812AU) DKMS Installer
+# AWUS036ACH (RTL8812AU) DKMS Installer
 
 This repository provides a **DKMS-based installer** for the **ALFA AWUS036ACH** USB Wi-Fi adapter using the **Realtek RTL8812AU** chipset on **Arch-based Linux distributions**.
 
