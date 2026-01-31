@@ -54,10 +54,7 @@ log "Kernel headers package: ${HEADERS_PKG}"
 
 log "Updating system and installing dependencies..."
 sudo pacman -Syu --noconfirm
-sudo pacman -S --needed --noconfirm "${HEADERS_PKG}" base-devel dkms git
-
-# GCC toolchain is required for the GCC fallback path.
-sudo pacman -S --needed --noconfirm gcc make
+sudo pacman -S --needed --noconfirm "${HEADERS_PKG}" base-devel dkms git gcc make
 
 # Verify headers exist for running kernel
 if [[ ! -e "/usr/lib/modules/${KREL}/build" ]]; then
@@ -85,33 +82,105 @@ ensure_yay() {
 
 ensure_yay
 
+# Make yay non-interactive (no clean/diff prompts)
+YAY_FLAGS=(--noconfirm --needed --answerclean None --answerdiff None --removemake)
+
 log "Unloading any currently-loaded 88xxau/8812au modules (best effort)..."
 sudo modprobe -r 88XXau 2>/dev/null || true
 sudo modprobe -r 8812au 2>/dev/null || true
 
 log "Selecting and installing an RTL8812AU DKMS driver from AUR (rolling-safe + fallback)..."
 
-# Candidates (try newer tree first on rolling kernels)
+# Try newer tree first on rolling kernels
 CANDIDATES=(
   "rtl8812au-dkms-git"
   "rtl8812au-aircrack-ng-dkms-git"
 )
 
-# Find newest rtl8812au dkms version currently registered (after install)
 dkms_find_rtl8812au_version() {
+  # Prefer /usr/src naming if present; otherwise dkms status parsing
   dkms status 2>/dev/null | awk -F'[/, ]' '/^rtl8812au\//{print $2}' | head -n 1
 }
 
-# Print best-effort make.log path(s) for rtl8812au DKMS builds
-print_make_logs_hint() {
-  local base="/var/lib/dkms/rtl8812au"
-  if [[ -d "$base" ]]; then
-    echo "== DKMS make logs (recent) =="
-    ls -1t "$base"/*/build/make.log 2>/dev/null | head -n 5 || true
-  else
-    echo "== DKMS make logs =="
-    echo "No /var/lib/dkms/rtl8812au directory found."
+find_dkms_conf_paths() {
+  local ver="$1"
+  # Common places:
+  #  - /usr/src/rtl8812au-<ver>/dkms.conf
+  #  - /var/lib/dkms/rtl8812au/<ver>/source/dkms.conf
+  local paths=()
+  if [[ -n "$ver" ]]; then
+    [[ -f "/usr/src/rtl8812au-${ver}/dkms.conf" ]] && paths+=("/usr/src/rtl8812au-${ver}/dkms.conf")
+    [[ -f "/var/lib/dkms/rtl8812au/${ver}/source/dkms.conf" ]] && paths+=("/var/lib/dkms/rtl8812au/${ver}/source/dkms.conf")
   fi
+  # Also scan if version path differs (git pkgver quirks)
+  while IFS= read -r p; do paths+=("$p"); done < <(ls -1 /usr/src/rtl8812au-*/dkms.conf 2>/dev/null || true)
+  while IFS= read -r p; do paths+=("$p"); done < <(ls -1 /var/lib/dkms/rtl8812au/*/source/dkms.conf 2>/dev/null || true)
+
+  # De-dupe
+  printf "%s\n" "${paths[@]}" | awk '!seen[$0]++'
+}
+
+tail_make_logs() {
+  local ver="$1"
+  local logpath=""
+  if [[ -n "$ver" && -f "/var/lib/dkms/rtl8812au/${ver}/build/make.log" ]]; then
+    logpath="/var/lib/dkms/rtl8812au/${ver}/build/make.log"
+  else
+    # Best-effort: newest rtl8812au make.log
+    logpath="$(ls -1t /var/lib/dkms/rtl8812au/*/build/make.log 2>/dev/null | head -n 1 || true)"
+  fi
+
+  if [[ -n "$logpath" && -f "$logpath" ]]; then
+    echo
+    echo "== DKMS make.log (tail 80) =="
+    echo "Path: ${logpath}"
+    sudo tail -n 80 "$logpath" || true
+    echo
+  else
+    echo
+    echo "== DKMS make.log =="
+    echo "No make.log found under /var/lib/dkms/rtl8812au/*/build/"
+    echo
+  fi
+}
+
+patch_dkms_conf_force_gcc() {
+  local ver="$1"
+  local patched="0"
+
+  while IFS= read -r conf; do
+    [[ -f "$conf" ]] || continue
+    # Patch rules:
+    # - If LLVM=1 appears in MAKE[...] lines, flip to LLVM=0
+    # - If LLVM= is absent, append LLVM=0 to MAKE[0] line (best effort)
+    log "Patching DKMS config to force GCC (LLVM=0): $conf"
+    sudo sed -i \
+      -e 's/\bLLVM=1\b/LLVM=0/g' \
+      -e 's/\bLLVM= 1\b/LLVM=0/g' \
+      "$conf" || true
+
+    # If there are MAKE[...] lines and none contain LLVM=, append LLVM=0
+    if sudo grep -qE '^[[:space:]]*MAKE\[[0-9]+\]=' "$conf"; then
+      if ! sudo grep -qE '^[[:space:]]*MAKE\[[0-9]+\]=.*\bLLVM=' "$conf"; then
+        sudo sed -i -E 's/^(MAKE\[[0-9]+\]=.*)"/\1 LLVM=0"/' "$conf" || true
+      fi
+    fi
+
+    patched="1"
+  done < <(find_dkms_conf_paths "$ver")
+
+  [[ "$patched" == "1" ]]
+}
+
+dkms_rebuild_install_force() {
+  local ver="$1"
+  local krel="$2"
+
+  # Clean any partial state for this kernel (best effort)
+  sudo dkms remove "rtl8812au/${ver}" -k "${krel}" --force 2>/dev/null || true
+
+  # Force install (some DKMS installs collide)
+  sudo dkms install "rtl8812au/${ver}" -k "${krel}" --force
 }
 
 install_and_build_for_kernel() {
@@ -125,47 +194,44 @@ install_and_build_for_kernel() {
     return 1
   fi
 
-  # Install candidate
-  yay -S --needed --noconfirm "${pkg}" || return 1
+  # Install candidate (non-interactive)
+  yay -S "${YAY_FLAGS[@]}" "${pkg}" || return 1
 
-  # Determine the rtl8812au version DKMS registered
+  # Determine DKMS module version
   local dk_ver=""
   dk_ver="$(dkms_find_rtl8812au_version || true)"
-  if [[ -n "$dk_ver" ]]; then
-    log "Detected DKMS module: rtl8812au, version: ${dk_ver}"
-  else
+  if [[ -z "$dk_ver" ]]; then
     warn "Could not detect rtl8812au DKMS version. Will still attempt build."
+  else
+    log "Detected DKMS module: rtl8812au, version: ${dk_ver}"
   fi
 
-  # Attempt 1: default DKMS build (may use LLVM on some kernels/distros)
-  log "Forcing DKMS build for running kernel: ${krel} (default toolchain)"
+  # Attempt 1: DKMS autoinstall for the running kernel
+  log "Forcing DKMS build for running kernel: ${krel} (default)"
   if sudo dkms autoinstall -k "${krel}"; then
     ok "DKMS build succeeded for ${pkg} on kernel ${krel}"
     return 0
   fi
 
   warn "DKMS default build failed for ${pkg} on kernel ${krel}"
-  warn "Retrying DKMS build using GCC fallback (LLVM=0, CC=gcc)..."
+  tail_make_logs "${dk_ver}"
 
-  # Clean any partial install for this kernel (best effort)
+  # Attempt 2: Patch dkms.conf to stop forcing LLVM=1, then rebuild with --force
   if [[ -n "$dk_ver" ]]; then
-    sudo dkms remove "rtl8812au/${dk_ver}" -k "${krel}" --force 2>/dev/null || true
+    warn "Applying rolling-safe patch: force GCC by patching dkms.conf (LLVM=0) and rebuilding..."
+    patch_dkms_conf_force_gcc "${dk_ver}" || warn "dkms.conf patch may not have applied (continuing anyway)."
 
-    # Attempt 2: GCC fallback build+install
-    if sudo env LLVM=0 CC=gcc CXX=g++ dkms install "rtl8812au/${dk_ver}" -k "${krel}"; then
-      ok "DKMS build succeeded with GCC fallback for ${pkg} on kernel ${krel}"
+    if dkms_rebuild_install_force "${dk_ver}" "${krel}"; then
+      ok "DKMS build succeeded after GCC/LLVM patch for ${pkg} on kernel ${krel}"
       return 0
     fi
+
+    warn "Patched rebuild still failed for ${pkg} on kernel ${krel}"
+    tail_make_logs "${dk_ver}"
   else
-    # Last resort: try autoinstall again with GCC env overrides
-    if sudo env LLVM=0 CC=gcc CXX=g++ dkms autoinstall -k "${krel}"; then
-      ok "DKMS build succeeded with GCC fallback for ${pkg} on kernel ${krel}"
-      return 0
-    fi
+    warn "No DKMS version detected, cannot patch dkms.conf reliably."
   fi
 
-  warn "DKMS build failed for ${pkg} on kernel ${krel} (default + GCC fallback)."
-  print_make_logs_hint
   warn "Removing ${pkg} and trying next candidate..."
   yay -Rns --noconfirm "${pkg}" || true
   return 1
@@ -180,9 +246,7 @@ for pkg in "${CANDIDATES[@]}"; do
 done
 
 if [[ -z "${PKG_OK}" ]]; then
-  warn "All candidate RTL8812AU DKMS drivers failed to build for kernel ${KREL}."
-  print_make_logs_hint
-  die "No working RTL8812AU DKMS driver could be built for this kernel."
+  die "All candidate RTL8812AU DKMS drivers failed to build for kernel ${KREL}. See make.log output above."
 fi
 
 log "Using working package: ${PKG_OK}"
